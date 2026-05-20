@@ -85,6 +85,14 @@ struct WebViewInstance {
     std::atomic<bool> captureInProgress{ false };
     HANDLE captureDoneEvent = nullptr;
 
+    // Bitmap generation counter — incremented each time a new capture completes.
+    // The C# side compares this to skip redundant texture uploads.
+    std::atomic<uint64_t> bitmapGeneration{ 0 };
+
+    // Last time an input event (mouse/key) was received (GetTickCount64).
+    // Used to throttle captures when idle.
+    std::atomic<uint64_t> lastInteractionTick{ 0 };
+
     // Custom headers for navigation
     std::mutex headersMutex;
     std::wstring customHeaders; // "Key: Value\r\n..."
@@ -156,6 +164,7 @@ enum CustomMsg {
     WM_WEBVIEW_LOAD_URL,
     WM_WEBVIEW_LOAD_HTML,
     WM_WEBVIEW_EVAL_JS,
+    WM_WEBVIEW_ADD_SCRIPT_ON_LOAD,  // AddScriptToExecuteOnDocumentCreated; runs before any page script on every navigation
     WM_WEBVIEW_SET_RECT,
     WM_WEBVIEW_SET_VISIBILITY,
     WM_WEBVIEW_GO_BACK,
@@ -298,9 +307,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                     Callback<ICoreWebView2NavigationStartingEventHandler>(
                                         [inst](ICoreWebView2* wv, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
                                             inst->progress = 0;
+                                            inst->lastInteractionTick = GetTickCount64();
                                             LPWSTR uriRaw = nullptr;
                                             args->get_Uri(&uriRaw);
                                             if (uriRaw) {
+                                                // Block dangerous schemes: file://, blob:, javascript:
+                                                std::wstring ws(uriRaw);
+                                                if (ws.find(L"file://") == 0 || ws.find(L"blob:") == 0 ||
+                                                    ws.find(L"javascript:") == 0) {
+                                                    args->put_Cancel(TRUE);
+                                                    CoTaskMemFree(uriRaw);
+                                                    return S_OK;
+                                                }
                                                 int n = WideCharToMultiByte(CP_UTF8, 0, uriRaw, -1, nullptr, 0, nullptr, nullptr);
                                                 std::string uri(n, 0);
                                                 WideCharToMultiByte(CP_UTF8, 0, uriRaw, -1, &uri[0], n, nullptr, nullptr);
@@ -339,6 +357,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                                 std::lock_guard<std::mutex> lk(inst->cacheMutex);
                                                 inst->canGoBack = (back != FALSE);
                                                 inst->canGoForward = (fwd != FALSE);
+                                            }
+                                            return S_OK;
+                                        }).Get(), nullptr);
+
+                                // Block ALL downloads — cancel them immediately
+                                ComPtr<ICoreWebView2_4> wv4;
+                                if (SUCCEEDED(inst->webview->QueryInterface(IID_PPV_ARGS(&wv4))) && wv4) {
+                                    wv4->add_DownloadStarting(
+                                        Callback<ICoreWebView2DownloadStartingEventHandler>(
+                                            [](ICoreWebView2* /*wv*/, ICoreWebView2DownloadStartingEventArgs* args) -> HRESULT {
+                                                args->put_Cancel(TRUE);
+                                                return S_OK;
+                                            }).Get(), nullptr);
+                                }
+
+                                // Block new-window requests (popups / target=_blank) —
+                                // navigate the current webview to the URL instead
+                                inst->webview->add_NewWindowRequested(
+                                    Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                                        [inst](ICoreWebView2* wv, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+                                            args->put_Handled(TRUE);
+                                            LPWSTR uri = nullptr;
+                                            args->get_Uri(&uri);
+                                            if (uri) {
+                                                wv->Navigate(uri);
+                                                CoTaskMemFree(uri);
                                             }
                                             return S_OK;
                                         }).Get(), nullptr);
@@ -419,6 +463,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     }
+    case WM_WEBVIEW_ADD_SCRIPT_ON_LOAD: {
+        // Register a script that runs before any page script on every navigation
+        // (NEW document, before its <head> parses). Same primitive WebView2 itself
+        // uses to inject window.Unity at line ~285. Used by the mod for volume
+        // hooks — applying volume from EvaluateJS after NavigationCompleted leaves
+        // a window where freshly-created media elements play at default 1.0.
+        if (inst && inst->webview) {
+            wchar_t* js = (wchar_t*)lParam;
+            inst->webview->AddScriptToExecuteOnDocumentCreated(js, nullptr);
+            delete[] js;
+        }
+        return 0;
+    }
     case WM_WEBVIEW_SET_RECT: {
         if (inst && inst->controller) {
             int w = (int)wParam;
@@ -459,7 +516,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         CreateStreamOnHGlobal(nullptr, TRUE, &stream);
         ComPtr<IStream> streamRef = stream;
 
-        HRESULT errCapture = inst->webview->CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, stream.Get(),
+        HRESULT errCapture = inst->webview->CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG, stream.Get(),
             Callback<ICoreWebView2CapturePreviewCompletedHandler>(
                 [inst, streamRef](HRESULT err) -> HRESULT {
                     if (SUCCEEDED(err) && streamRef) {
@@ -475,6 +532,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             inst->bitmapPixels.swap(inst->bitmapPixelsBack);
                             inst->bitmapWidth = inst->bitmapWidthBack;
                             inst->bitmapHeight = inst->bitmapHeightBack;
+                            inst->bitmapGeneration++;
                         }
                     }
                     if (inst->captureDoneEvent) SetEvent(inst->captureDoneEvent);
@@ -490,6 +548,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_WEBVIEW_SEND_MOUSE: {
         MouseEventData* data = (MouseEventData*)lParam;
         if (!inst || !data) return 0;
+        inst->lastInteractionTick = GetTickCount64();
         int winX = data->x;
         int winY = inst->rectHeight > 0 ? (inst->rectHeight - 1 - data->y) : data->y;
         winX = (winX < 0) ? 0 : (winX >= inst->rectWidth ? inst->rectWidth - 1 : winX);
@@ -533,31 +592,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_WEBVIEW_SEND_KEY: {
         KeyEventData* data = (KeyEventData*)lParam;
         if (!inst || !data) return 0;
+        inst->lastInteractionTick = GetTickCount64();
         HWND child = GetWindow(hwnd, GW_CHILD);
         HWND target = child ? child : hwnd;
         WV_LOG("KEY recv: hwnd=%p child=%p target=%p keyCode=%u keyState=%d hasChars=%d",
                (void*)hwnd, (void*)child, (void*)target, (unsigned)data->keyCode, data->keyState,
                data->keyChars && data->keyChars[0] ? 1 : 0);
-        HWND fg = GetForegroundWindow();
-        SetFocus(target);
+        // Do NOT call SetFocus(target) — it steals keyboard focus from Unity's
+        // main window, causing double-input and preventing the game from receiving
+        // input after the webview is closed.  SendMessage delivers messages to any
+        // HWND regardless of focus state.
         if (data->keyChars && data->keyChars[0]) {
+            // Send the full WM_KEYDOWN → WM_CHAR → WM_KEYUP sequence for each
+            // character.  Sending WM_CHAR alone skips the JavaScript keydown/keyup
+            // events, which breaks frameworks (React, etc.) that rely on them.
             WCHAR wch[32];
             int n = MultiByteToWideChar(CP_UTF8, 0, data->keyChars, -1, wch, 32);
             if (n > 0) {
                 for (int i = 0; wch[i]; i++) {
-                    SendMessage(target, WM_CHAR, (WPARAM)wch[i], 0);
+                    SHORT vkScan = VkKeyScanW(wch[i]);
+                    WORD vk = LOBYTE(vkScan);
+                    if (vk != 0xFF) {
+                        UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+                        LPARAM lp = 1 | ((LPARAM)sc << 16);
+                        SendMessage(target, WM_KEYDOWN, (WPARAM)vk, lp);
+                        SendMessage(target, WM_CHAR, (WPARAM)wch[i], lp);
+                        SendMessage(target, WM_KEYUP, (WPARAM)vk, lp | (3ULL << 30));
+                    } else {
+                        // Unmappable character — fall back to WM_CHAR only
+                        SendMessage(target, WM_CHAR, (WPARAM)wch[i], 0);
+                    }
                 }
             }
         }
-        if (data->keyCode != 0) {
+        if (data->keyCode != 0 && (!data->keyChars || !data->keyChars[0])) {
+            // Special keys (Backspace, Enter, Tab, Escape) — no keyChars, just keyCode
             LPARAM lp = 1 | (LPARAM)MapVirtualKeyW(data->keyCode, MAPVK_VK_TO_VSC) << 16;
             if (data->keyState == 1 || data->keyState == 2)
                 SendMessage(target, WM_KEYDOWN, (WPARAM)data->keyCode, lp);
             if (data->keyState == 3)
-                SendMessage(target, WM_KEYUP, (WPARAM)data->keyCode, lp);
+                SendMessage(target, WM_KEYUP, (WPARAM)data->keyCode, lp | (3ULL << 30));
         }
-        if (fg && fg != hwnd)
-            SetForegroundWindow(fg);
         delete[] data->keyChars;
         delete data;
         return 0;
@@ -783,6 +858,20 @@ __declspec(dllexport) void _CWebViewPlugin_EvaluateJS(void* instance, const char
     PostMessage(inst->hwnd, WM_WEBVIEW_EVAL_JS, 0, (LPARAM)w);
 }
 
+// Register a script to run before any page script on every navigation. Wraps
+// ICoreWebView2.AddScriptToExecuteOnDocumentCreated. Call once after Init; the
+// script persists across navigations within this WebView instance. Critical for
+// hooks that must beat the page's own JS (e.g. clamping media element volume
+// before the engine plays the first audio frame).
+__declspec(dllexport) void _CWebViewPlugin_AddScriptOnLoad(void* instance, const char* js) {
+    WebViewInstance* inst = (WebViewInstance*)instance;
+    if (!inst || inst->destroying || !js) return;
+    int n = MultiByteToWideChar(CP_UTF8, 0, js, -1, nullptr, 0);
+    wchar_t* w = new wchar_t[n];
+    MultiByteToWideChar(CP_UTF8, 0, js, -1, w, n);
+    PostMessage(inst->hwnd, WM_WEBVIEW_ADD_SCRIPT_ON_LOAD, 0, (LPARAM)w);
+}
+
 // Returns load progress 0-100. Value is 0 when navigation starts, 100 when it completes successfully, and 0 on failure.
 // Using Progress() == 100 to detect "load complete" is correct. For a smooth progress bar, note that WebView2 does
 // not expose an estimatedProgress like WKWebView; we only get two states (0 and 100), so the progress is not gradual.
@@ -845,8 +934,11 @@ __declspec(dllexport) void _CWebViewPlugin_SendKeyEvent(void* instance, int x, i
 __declspec(dllexport) void _CWebViewPlugin_Update(void* instance, bool refreshBitmap, int devicePixelRatio) {
     WebViewInstance* inst = (WebViewInstance*)instance;
     if (!inst || inst->destroying) return;
+    (void)devicePixelRatio;
     // Non-blocking: only start a new capture when none is in progress. STA thread uses
     // double-buffering so Render() can read current bitmapPixels without delay.
+    // The caller controls the refresh rate via refreshBitmap; we just guard against
+    // overlapping captures.
     if (refreshBitmap && inst->hwnd && inst->webview) {
         if (!inst->captureInProgress.exchange(true)) {
             PostMessage(inst->hwnd, WM_WEBVIEW_CAPTURE, 0, 0);
@@ -866,6 +958,18 @@ __declspec(dllexport) int _CWebViewPlugin_BitmapHeight(void* instance) {
     if (!inst || inst->destroying) return 0;
     std::lock_guard<std::mutex> lk(inst->bitmapMutex);
     return inst->bitmapHeight;
+}
+
+__declspec(dllexport) unsigned long long _CWebViewPlugin_BitmapGeneration(void* instance) {
+    WebViewInstance* inst = (WebViewInstance*)instance;
+    if (!inst || inst->destroying) return 0;
+    return inst->bitmapGeneration.load();
+}
+
+__declspec(dllexport) unsigned long long _CWebViewPlugin_LastInteractionTick(void* instance) {
+    WebViewInstance* inst = (WebViewInstance*)instance;
+    if (!inst || inst->destroying) return 0;
+    return inst->lastInteractionTick.load();
 }
 
 __declspec(dllexport) void _CWebViewPlugin_Render(void* instance, void* textureBuffer) {
