@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include "WebView2.h"
+#include "WebView2EnvironmentOptions.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -165,6 +166,7 @@ enum CustomMsg {
     WM_WEBVIEW_LOAD_HTML,
     WM_WEBVIEW_EVAL_JS,
     WM_WEBVIEW_ADD_SCRIPT_ON_LOAD,  // AddScriptToExecuteOnDocumentCreated; runs before any page script on every navigation
+    WM_WEBVIEW_LOAD_EXTENSION,      // Profile->AddBrowserExtension; lParam = wchar_t* (owned, freed by handler)
     WM_WEBVIEW_SET_RECT,
     WM_WEBVIEW_SET_VISIBILITY,
     WM_WEBVIEW_GO_BACK,
@@ -233,8 +235,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         CreateDirectoryW(path.c_str(), nullptr);
 
         ComPtr<ICoreWebView2Environment> env;
+        // Build env options with browser extensions enabled. Required so
+        // ICoreWebView2Profile7::AddBrowserExtension will accept unpacked
+        // Chromium extensions (e.g. uBlock Origin) later in the lifecycle.
+        // CoreWebView2EnvironmentOptions (from WebView2EnvironmentOptions.h)
+        // implements the full Options1..8 chain; AreBrowserExtensionsEnabled is
+        // on Options6 (SDK ≥ 1.0.2210.55). Falling back to nullptr would leave
+        // the runtime in its default state where AddBrowserExtension is
+        // rejected with E_INVALIDARG.
+        auto envOptions = Make<CoreWebView2EnvironmentOptions>();
+        if (envOptions) {
+            ComPtr<ICoreWebView2EnvironmentOptions6> envOptions6;
+            if (SUCCEEDED(envOptions.As(&envOptions6)) && envOptions6) {
+                envOptions6->put_AreBrowserExtensionsEnabled(TRUE);
+            }
+        }
         HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-            nullptr, path.c_str(), nullptr,
+            nullptr, path.c_str(), envOptions.Get(),
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
                 [params](HRESULT err, ICoreWebView2Environment* e) -> HRESULT {
                     if (FAILED(err)) {
@@ -474,6 +491,76 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             inst->webview->AddScriptToExecuteOnDocumentCreated(js, nullptr);
             delete[] js;
         }
+        return 0;
+    }
+    case WM_WEBVIEW_LOAD_EXTENSION: {
+        // Profile->AddBrowserExtension. Path is an absolute wchar_t* to an
+        // unpacked Chromium extension directory (with manifest.json). Ownership
+        // transferred from the export; we free after AddBrowserExtension
+        // returns its initial HRESULT (the result callback fires later, but the
+        // path string is copied internally by the runtime).
+        //
+        // Profile-bound: once loaded, the extension persists in the user data
+        // folder across sessions. Re-adding the same extension by id on a later
+        // run is idempotent on the runtime side — it just re-resolves to the
+        // already-installed entry. We forward the result to the C# message
+        // queue as "ExtensionLoaded:<id>" or "ExtensionError:<hex>" so the
+        // mod can log without polling.
+        wchar_t* extPath = (wchar_t*)lParam;
+        if (!inst || !inst->webview || !extPath) {
+            if (extPath) delete[] extPath;
+            return 0;
+        }
+        ComPtr<ICoreWebView2_13> wv13;
+        if (FAILED(inst->webview->QueryInterface(IID_PPV_ARGS(&wv13))) || !wv13) {
+            inst->messages.push("ExtensionError:no-icorewebview2_13");
+            delete[] extPath;
+            return 0;
+        }
+        ComPtr<ICoreWebView2Profile> profile;
+        wv13->get_Profile(&profile);
+        if (!profile) {
+            inst->messages.push("ExtensionError:no-profile");
+            delete[] extPath;
+            return 0;
+        }
+        ComPtr<ICoreWebView2Profile7> profile7;
+        if (FAILED(profile->QueryInterface(IID_PPV_ARGS(&profile7))) || !profile7) {
+            inst->messages.push("ExtensionError:no-icorewebview2profile7");
+            delete[] extPath;
+            return 0;
+        }
+
+        WebViewInstance* capInst = inst;
+        HRESULT hrAdd = profile7->AddBrowserExtension(extPath,
+            Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+                [capInst](HRESULT err, ICoreWebView2BrowserExtension* ext) -> HRESULT {
+                    if (SUCCEEDED(err) && ext) {
+                        LPWSTR id = nullptr;
+                        ext->get_Id(&id);
+                        if (id) {
+                            int n = WideCharToMultiByte(CP_UTF8, 0, id, -1, nullptr, 0, nullptr, nullptr);
+                            std::string sid(n > 0 ? n : 1, 0);
+                            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, id, -1, &sid[0], n, nullptr, nullptr);
+                            if (!sid.empty() && sid.back() == '\0') sid.pop_back();
+                            capInst->messages.push("ExtensionLoaded:" + sid);
+                            CoTaskMemFree(id);
+                        } else {
+                            capInst->messages.push("ExtensionLoaded:unknown");
+                        }
+                    } else {
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)err);
+                        capInst->messages.push(std::string("ExtensionError:") + buf);
+                    }
+                    return S_OK;
+                }).Get());
+        if (FAILED(hrAdd)) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "0x%08X", (unsigned)hrAdd);
+            inst->messages.push(std::string("ExtensionError:dispatch-") + buf);
+        }
+        delete[] extPath;
         return 0;
     }
     case WM_WEBVIEW_SET_RECT: {
@@ -870,6 +957,30 @@ __declspec(dllexport) void _CWebViewPlugin_AddScriptOnLoad(void* instance, const
     wchar_t* w = new wchar_t[n];
     MultiByteToWideChar(CP_UTF8, 0, js, -1, w, n);
     PostMessage(inst->hwnd, WM_WEBVIEW_ADD_SCRIPT_ON_LOAD, 0, (LPARAM)w);
+}
+
+// Load an unpacked Chromium extension into this WebView's profile.
+// extensionFolderPath must be an absolute path to a directory containing a
+// manifest.json (e.g. an uncompressed uBlock Origin chromium build).
+//
+// Profile-bound: extensions persist in the user-data folder, so subsequent
+// runs inherit the install — re-adding by id is idempotent on the runtime
+// side. Result is reported asynchronously via the message queue as
+// "ExtensionLoaded:<id>" or "ExtensionError:<reason>" so the C# layer can
+// log without blocking the spawn flow.
+//
+// Requires WebView2 runtime ≥ 119 (June 2024) and that the environment was
+// created with AreBrowserExtensionsEnabled=TRUE (handled in WM_CREATE).
+// On older runtimes the QueryInterface for ICoreWebView2Profile7 returns
+// E_NOINTERFACE and we report ExtensionError:no-icorewebview2profile7.
+__declspec(dllexport) void _CWebViewPlugin_LoadExtension(void* instance, const char* extensionFolderPath) {
+    WebViewInstance* inst = (WebViewInstance*)instance;
+    if (!inst || inst->destroying || !extensionFolderPath) return;
+    int n = MultiByteToWideChar(CP_UTF8, 0, extensionFolderPath, -1, nullptr, 0);
+    if (n <= 0) return;
+    wchar_t* w = new wchar_t[n];
+    MultiByteToWideChar(CP_UTF8, 0, extensionFolderPath, -1, w, n);
+    PostMessage(inst->hwnd, WM_WEBVIEW_LOAD_EXTENSION, 0, (LPARAM)w);
 }
 
 // Returns load progress 0-100. Value is 0 when navigation starts, 100 when it completes successfully, and 0 on failure.
