@@ -295,12 +295,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                 inst->webview->get_Settings(&settings);
                                 if (settings) {
                                     settings->put_IsScriptEnabled(TRUE);
-                                    settings->put_AreDefaultScriptDialogsEnabled(TRUE);
+                                    // Suppress alert()/confirm()/prompt() and the
+                                    // "Leave site?" beforeunload nag. With default
+                                    // dialogs disabled, alert() no-ops, confirm()
+                                    // returns false and beforeunload auto-accepts —
+                                    // ad-heavy streaming pages lean on these to trap
+                                    // the user, so we kill them outright.
+                                    settings->put_AreDefaultScriptDialogsEnabled(FALSE);
                                 }
 
                                 // Inject Unity.call for JS -> C#
                                 std::wstring script = L"window.Unity = { call: function(msg) { window.chrome.webview.postMessage(msg); } };";
                                 inst->webview->AddScriptToExecuteOnDocumentCreated(script.c_str(), nullptr);
+
+                                // Popup/popunder killer — runs before page script in
+                                // EVERY frame (AddScriptToExecuteOnDocumentCreated
+                                // injects into sub-frames too, which is where ad
+                                // iframes spawn popunders). Neutralises window.open so
+                                // script-driven popups silently fail; genuine same-tab
+                                // navigation uses location/anchor clicks (handled by
+                                // the native NewWindowRequested path), so legitimate
+                                // browsing is unaffected. Made non-writable/-configurable
+                                // so ad scripts can't restore the original.
+                                std::wstring popupGuard =
+                                    L"(function(){try{var n=function(){return null;};"
+                                    L"try{Object.defineProperty(window,'open',{value:n,writable:false,configurable:false});}"
+                                    L"catch(e){window.open=n;}"
+                                    L"try{window.alert=function(){};window.print=function(){};}catch(e){}"
+                                    L"}catch(e){}})();";
+                                inst->webview->AddScriptToExecuteOnDocumentCreated(popupGuard.c_str(), nullptr);
 
                                 // Message from JS
                                 inst->webview->add_WebMessageReceived(
@@ -389,18 +412,56 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                             }).Get(), nullptr);
                                 }
 
-                                // Block new-window requests (popups / target=_blank) —
-                                // navigate the current webview to the URL instead
+                                // New-window requests (popups / window.open / target=_blank).
+                                // Always set Handled=TRUE so WebView2 never spawns a
+                                // detached top-level window — our composition controller
+                                // renders to a texture and has no surface for one, so an
+                                // unhandled request would leak an invisible webview.
+                                //
+                                // Ad-heavy streaming sites fire popunder/interstitial
+                                // windows from script and timers (NOT a user gesture).
+                                // The old code navigated the MAIN view to every such URL,
+                                // so each popunder hijacked the stream. Gate on
+                                // IsUserInitiated: drop anything without a genuine user
+                                // gesture, and only redirect real clicks into the existing
+                                // view (keeps target=_blank click-throughs and normal
+                                // browsing working). uBlock still network-blocks most ad
+                                // hosts that slip through on a click.
                                 inst->webview->add_NewWindowRequested(
                                     Callback<ICoreWebView2NewWindowRequestedEventHandler>(
                                         [inst](ICoreWebView2* wv, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
                                             args->put_Handled(TRUE);
+
+                                            BOOL userInitiated = FALSE;
+                                            args->get_IsUserInitiated(&userInitiated);
+                                            if (!userInitiated) {
+                                                // Popunder / auto-ad — block silently.
+                                                return S_OK;
+                                            }
+
                                             LPWSTR uri = nullptr;
                                             args->get_Uri(&uri);
                                             if (uri) {
-                                                wv->Navigate(uri);
+                                                // Only follow http(s); drop javascript:/data:/blob: popups.
+                                                std::wstring ws(uri);
+                                                if (ws.rfind(L"http://", 0) == 0 || ws.rfind(L"https://", 0) == 0) {
+                                                    wv->Navigate(uri);
+                                                }
                                                 CoTaskMemFree(uri);
                                             }
+                                            return S_OK;
+                                        }).Get(), nullptr);
+
+                                // Deny every permission request (notifications,
+                                // geolocation, camera, mic, clipboard, etc.). Ad-heavy
+                                // streaming sites spam the notification-permission prompt
+                                // to push ads to the OS even after you leave, and nothing
+                                // we render legitimately needs any of these. Denying
+                                // silently also removes the prompt UI entirely.
+                                inst->webview->add_PermissionRequested(
+                                    Callback<ICoreWebView2PermissionRequestedEventHandler>(
+                                        [](ICoreWebView2* /*wv*/, ICoreWebView2PermissionRequestedEventArgs* args) -> HRESULT {
+                                            args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
                                             return S_OK;
                                         }).Get(), nullptr);
 
